@@ -1,0 +1,124 @@
+# ============================================================
+# 开星内核 · 定制 kernelsu.ko 构建
+#
+# 目标：完全仿照官方 KernelSU 的 LKM 构建，只改一处——
+#       让内核把「开星内核」(com.kaixing.kernel) 认作管理器。
+#       其余源码、编译命令、工具链一律不动。
+#
+# 用法：Fork tiann/KernelSU -> 把本文件放进 .github/workflows/
+#       -> Actions 页面手动 Run workflow -> 填入 size 和 hash
+# ============================================================
+name: Build 开星内核 kernelsu.ko
+
+on:
+  workflow_dispatch:
+    inputs:
+      kmi:
+        description: 'KMI 版本（6.12 内核填 android16-6.12）'
+        required: true
+        default: 'android16-6.12'
+        type: string
+      expected_size:
+        description: '开星内核 APK 签名 size，带 0x 前缀，例如 0x29a'
+        required: true
+        type: string
+      expected_hash:
+        description: '开星内核 APK 签名 hash，64 位十六进制，不带 0x'
+        required: true
+        type: string
+      mode:
+        description: '签名写入方式'
+        required: true
+        default: 'add'
+        type: choice
+        options:
+          # add   = 写第二组，官方管理器 + 开星内核 都能用（推荐，有退路）
+          # solo  = 覆盖第一组，只有开星内核能用（彻底独立后再用）
+          - add
+          - solo
+      ddk_release:
+        description: 'DDK 镜像版本（一般不用改）'
+        required: false
+        default: '20260828'
+        type: string
+
+jobs:
+  build:
+    name: Build kernelsu.ko for ${{ inputs.kmi }}
+    runs-on: ubuntu-latest
+    container:
+      # 与官方 ddk-lkm.yml 完全相同的镜像
+      image: ghcr.io/ylarod/ddk-min:${{ inputs.kmi }}-${{ inputs.ddk_release }}
+      options: --privileged
+
+    steps:
+      - name: Checkout KernelSU 源码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 校验输入
+        run: |
+          SZ="${{ inputs.expected_size }}"
+          HS="${{ inputs.expected_hash }}"
+          echo "size = $SZ"
+          echo "hash = $HS"
+          # size 必须带 0x 前缀（Makefile 里直接当数字用）
+          case "$SZ" in
+            0x*) ;;
+            *) echo "::error::size 必须以 0x 开头（例如 0x29a）"; exit 1 ;;
+          esac
+          # hash 不能带 0x 前缀（先查这个，否则长度报错会掩盖真正原因）
+          case "$HS" in
+            0x*) echo "::error::hash 不要带 0x 前缀，请去掉"; exit 1 ;;
+          esac
+          # hash 必须是 64 位十六进制
+          if [ ${#HS} -ne 64 ]; then
+            echo "::error::hash 必须是 64 位十六进制字符，当前长度 ${#HS}"
+            exit 1
+          fi
+          echo "$HS" | grep -qE '^[0-9a-fA-F]{64}$' || {
+            echo "::error::hash 含非法字符（只能是 0-9 a-f）"; exit 1; }
+          echo "[OK] 输入校验通过"
+
+      - name: Build kernelsu.ko
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          cd kernel
+          echo "=== KMI      : ${{ inputs.kmi }} ==="
+          echo "=== 签名模式 : ${{ inputs.mode }} ==="
+
+          EXTRA=""
+          if [ "${{ inputs.mode }}" = "solo" ]; then
+            # 覆盖第一组：只有开星内核能被识别
+            EXTRA="KSU_EXPECTED_SIZE=${{ inputs.expected_size }} KSU_EXPECTED_HASH=${{ inputs.expected_hash }}"
+            echo "已设为独占模式：官方管理器将失效，仅开星内核可用"
+          else
+            # 写第二组：官方管理器与开星内核都可用（推荐）
+            EXTRA="KSU_EXPECTED_SIZE2=${{ inputs.expected_size }} KSU_EXPECTED_HASH2=${{ inputs.expected_hash }}"
+            echo "已设为附加模式：官方管理器和开星内核都能用"
+          fi
+
+          # 编译命令与官方 ddk-lkm.yml 完全一致，只是多传了签名参数
+          CONFIG_KSU=m CC=clang make $EXTRA
+
+          ls -la kernelsu.ko
+
+      - name: 收集产物
+        run: |
+          cd kernel
+          OUT_DIR=/github/workspace/out/aarch64
+          mkdir -p "$OUT_DIR"
+          OUTPUT_NAME="${{ inputs.kmi }}_kernelsu.ko"
+          cp kernelsu.ko "$OUT_DIR/$OUTPUT_NAME"
+          llvm-strip -d "$OUT_DIR/$OUTPUT_NAME" 2>/dev/null || true
+          echo "产物: $OUT_DIR/$OUTPUT_NAME"
+          echo "大小: $(du -h "$OUT_DIR/$OUTPUT_NAME" | cut -f1)"
+          ls -la "$OUT_DIR"
+
+      - name: Upload kernelsu.ko
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.kmi }}-kernelsu-ko
+          path: /github/workspace/out/aarch64/${{ inputs.kmi }}_kernelsu.ko
+          retention-days: 90
